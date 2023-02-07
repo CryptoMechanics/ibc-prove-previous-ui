@@ -1,0 +1,780 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>IBC Reference UI</title>
+  <script src="https://code.jquery.com/jquery-3.6.0.min.js" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/anchor-link@3.5.1/lib/anchor-link.bundle.js"></script>
+  <script src="https://unpkg.com/anchor-link-browser-transport@3.5.1/lib/anchor-link-browser-transport.bundle.js"></script>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.2.0/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-gH2yIJqKdNHPEq0n4Mqa/HGKIhSkIHeL5AyhkYV8i59U5AR6csBvApHHNl/vI1Bx" crossorigin="anonymous">
+  <script src="https://bundle.run/buffer@6.0.3"></script>
+  <script type="module" src="/main.js"></script>
+  <script src="./createhash-browser.min.js"></script>
+
+</head>
+
+<body style="max-width:640px;margin:40px auto;">
+  <div id="app"></div>
+  <div class="container" style="border:1px solid #64646d;padding:24px;">
+    <h3 class="text-center">IBC DEMO</h3>
+    <div class="flexRow"  style="margin-top:24px;">
+      <select onchange="chainChanged()" class="form-select chainSelect" id="sourceChain">
+        <option value="" disabled selected>Select Source Chain</option>
+      </select>
+      <select  onchange="chainChanged()" class="form-select chainSelect" id="destinationChain">
+        <option value="" disabled selected>Select Destination Chain</option>
+      </select>
+    </div>
+    <div class="flexRow" style="margin-top:24px;">
+      <button style="display:none;" id="sourceLogin" onclick="login('source')" type="button" class="btn btn-success">Login</button>
+      <button style="display:none;" id="sourceLogout" onclick="logout('source')" type="button" class="btn btn-danger">Logout</button>
+      <button style="display:none;" id="destinationLogin" onclick="login('destination')" type="button" class="btn btn-success">Login</button>
+      <button style="display:none;" id="destinationLogout" onclick="logout('destination')" type="button" class="btn btn-danger">Logout</button>
+    </div>
+    <hr>
+    <div class="flexRow" style="margin-top:18px;">
+      <div class="input-group"  style="width:120px;margin-left:auto;margin-right:auto;">
+        <select style="width:120px;" class="form-select tokenSelect" id="sourceAsset">
+          <option value="" disabled selected>Token</option>
+        </select>
+      </div>
+    </div>
+    <div class="box"><section id="status">
+      <div><div>Fetching tokens available for IBC</div><div class="progressDiv">0%</div></div>
+    </section></div>
+    <div id="previousTransactions"></div>  
+    <div style="text-align:center;margin-top:24px;"><button id="resetBtn" onclick="reset()" style="display:none;" type="button" class="btn btn-primary">New Transfer</button></div>
+  </div>
+</body>
+
+<script>
+  
+  /*
+    Chain settings (change to connect to different infrastructure)
+    - nodeUrl: Nodeos API
+    - txExplorer: TX Explorer prefix
+    - proofSocket: IBC Proof WS Server
+    - bridgeContract: Name of account where IBC contract is deployed 
+    - wrapLockContractsArray: Array of the account names of desired wrap lock contracts
+  */
+
+  const chains = [{
+    chainId: 'aca376f206b8fc25a6ed44dbdc66547c36c6c33e3a119ffbeaef943642f0e906',
+    nodeUrl: 'https://eos.eosusa.io',
+    hyperion:"https://eos.eosusa.io",
+    name: "eos",
+    label: "EOS",
+    txExplorer: "https://eos.eosq.eosnation.io/tx",
+    proofSocket:  "wss://ibc-server.uxnetwork.io/eos",
+    bridgeContract:"ibc.prove",
+    wrapLockContractsArray: ["ibc.wl.ux", "ibc.wl.tlos"],
+    returnValue: true,
+  },{
+    chainId: '8fc6dce7942189f842170de953932b1f66693ad3788f766e777b6f9d22335c02',
+    nodeUrl: 'https://api.uxnetwork.io', 
+    hyperion: "https://ux.eosusa.io",
+    txExplorer: 'https://explorer.uxnetwork.io/tx',
+    name: "ux",
+    label: "UX",
+    proofSocket: "wss://ibc-server.uxnetwork.io/ux",
+    bridgeContract:"ibc.prove",
+    wrapLockContractsArray: ["ibc.wl.eos", "ibc.wl.tlos"],
+    returnValue: false,
+  },{
+    chainId: '4667b205c6838ef70ff7988f6e8257e8be0e1284a2f59699054a018f743b1d11',
+    nodeUrl: 'https://telos.api.eosnation.io', 
+    hyperion: "https://telos.eosusa.io",
+    txExplorer: 'https://explorer.telos.net/transaction',
+    name: "tlos",
+    label: "TELOS",
+    proofSocket: "wss://ibc-server.uxnetwork.io/telos",
+    bridgeContract:"ibc.prove",
+    wrapLockContractsArray: ["ibc.wl.ux", "ibc.wl.eos"],
+    returnValue: true,
+  }];
+
+  for (var chain of chains){
+    chain.session = null;
+    chain.symbols = null;
+    chain.auth = null;
+    chain.wrapLockContracts = [];
+  }
+
+  let sourceChain, destinationChain, tokenRow, fetchProgress=0,progressInterval, destinationActions, previousActions, lastBlockProvedRes;
+  fetchTokens();
+  
+  $(function() {  window.Buffer = buffer.Buffer; });
+
+  async function fetchTokens(){
+    //fetch wraplock contracts tokens & details
+    let promises = [];
+    let allWraplockContracts = []
+    //get global and contractmap rows from each chain
+    for (var chain of chains) for (var wrapLockContract of chain.wrapLockContractsArray) {
+      allWraplockContracts.push(wrapLockContract);
+      promises.push(
+        $.post(`${chain.nodeUrl}/v1/chain/get_table_rows`, JSON.stringify({ json: true, code: wrapLockContract, scope: wrapLockContract, table: 'global'})),
+        $.post(`${chain.nodeUrl}/v1/chain/get_table_rows`, JSON.stringify({ json: true, code: wrapLockContract, scope: wrapLockContract, table: 'contractmap'}))
+      )
+    }
+
+    const initialResults = (await Promise.all(promises)).map(r=>r.rows);
+    fetchProgress+=50;
+    $('.progressDiv').last().html(fetchProgress+"%");
+    let groupedResults = [];
+    while(initialResults.length) groupedResults.push(initialResults.splice(0, 2));
+    let tokenPromises = []
+    for (var result of groupedResults){
+      const global = result[0][0];
+      const contractMaps = result[1];
+
+      for (var map of contractMaps){
+        const chain = chains.find(c=>c.chainId === global.chain_id);
+        if (!chain) continue;
+        tokenPromises.push($.post(`${chain.nodeUrl}/v1/chain/get_table_by_scope`, JSON.stringify({ code: map.native_token_contract, table: 'stat'})))
+      }
+    }
+    const tokenResults = await Promise.all(tokenPromises);
+    let tokenResultsIndex = 0;
+    for (var result of groupedResults){
+      const global = result[0][0];
+      const contractMaps = result[1];
+      for (var map of contractMaps){
+        const chain = chains.find(c=>c.chainId === global.chain_id);
+        const pairedChain = chains.find(c=>c.chainId === global.paired_chain_id);
+        if (!chain) continue;
+        let symbolsres = tokenResults[tokenResultsIndex];
+        let symbols = symbolsres.rows.map(r => toName(nameToUint64(r.scope)));
+        console.log(`${chain.name} -> ${pairedChain.name} tokens: ${symbols}`)
+        chain.wrapLockContracts.push({
+          chain_id: global.chain_id,
+          wrapLockContract: allWraplockContracts[tokenResultsIndex],
+          nativeTokenContract: map.native_token_contract,
+          pairedChainId: global.paired_chain_id,
+          pairedWrapTokenContract: map.paired_wraptoken_contract,
+          symbols
+        });
+        tokenResultsIndex++;
+      }
+    }
+    console.log("chains",chains)
+    $('.progressDiv').last().html("100%");
+
+    //on DOM ready
+    $(async function() {
+      //add chain options to chain select elements
+      for (var chain of chains) {
+        $('#sourceChain').append(new Option(chain.label, chain.name));
+        $('#destinationChain').append(new Option(chain.label, chain.name));
+      }
+    });
+  }
+
+  //handler for source chain change
+  const chainChanged = () =>{
+    //clear Token select options
+    $('#sourceAsset').find('option').remove().end();
+    $('#sourceAsset').find('optgroup').remove().end();
+
+    let sourceName = $('#sourceChain').val();
+    let destinationName = $('#destinationChain').val();
+    sourceChain = chains.find(c=>c.name == sourceName);
+    destinationChain = chains.find(c=>c.name == destinationName);
+
+    if (sourceName === destinationName || !destinationName){
+      destinationChain = chains.find(c=>c.name !== sourceName);
+      $("#destinationChain").val(destinationChain.name);
+    }
+    $('#status').html("<div><div>Fetching tokens available for IBC</div><div class='progressDiv'>100%</div></div>");
+    logout("source");
+    logout("destination");
+
+    let id = 1, nativeList = [], wrappedList = [];
+    for (var row of sourceChain.wrapLockContracts.filter(r=>r.pairedChainId ==destinationChain.chainId)) for (var symbol of row.symbols) {
+      nativeList.push({ ...row, id, symbol, sourceTokenContract: row.nativeTokenContract, destinationTokenContract: row.pairedWrapTokenContract,  native: true });
+      id++;
+    }
+    nativeList = nativeList.sort((a, b) => (a.symbol > b.symbol ? 1 : -1));
+
+    id = 1000;
+    for (var row of destinationChain.wrapLockContracts.filter(r=>r.pairedChainId ==sourceChain.chainId)) for (var symbol of row.symbols) {
+      wrappedList.push({ ...row, id, symbol, sourceTokenContract: row.pairedWrapTokenContract, destinationTokenContract: row.nativeTokenContract, native: false });
+      id++;
+    }
+    wrappedList = wrappedList.sort((a, b) => (a.symbol > b.symbol ? 1 : -1));
+    sourceChain.symbols = [...nativeList, ...wrappedList];
+
+    
+    //set Token select options
+    let optionsHtml = `<optgroup label="Native">`
+    for (var r of sourceChain.symbols.filter(r=>r.native)) optionsHtml+=`<option value=${r.id}>${r.symbol}</option>`;
+    optionsHtml+=`</optgroup><optgroup label="Wrapped">`;
+    for (var r of sourceChain.symbols.filter(r=>!r.native)) optionsHtml+=`<option value=${r.id}>${r.symbol}</option>`;
+    optionsHtml+=`</optgroup>`;
+    $('#sourceAsset').append(optionsHtml);
+
+  }
+
+  $('#sourceAsset').on('change',e=>{
+    tokenRow = sourceChain.symbols.find(r=>r.id===parseInt($('#sourceAsset').val()));
+    getPreviousTransactions()
+  })
+  //UI functions
+  const login = type => {
+    const chain =  chains.find(c=>c.name===$(`#${type}Chain`).val());
+    const link = new AnchorLink({
+      transport: new AnchorLinkBrowserTransport(),
+      chains: [{ chainId: chain.chainId, nodeUrl: chain.nodeUrl}]
+    })
+    link.login("IBC")
+      .then((result) => {
+        chain.session = result.session;
+        chain.auth = { actor:chain.session.auth.actor.toString(), permission: chain.session.auth.permission.toString()}
+        $(`#${type}Login`).hide();
+        $(`#${type}Logout`).text(`Logout ${chain.auth.actor}@${chain.auth.permission}`);
+        $(`#${type}Logout`).show();
+        $(`#${type}Chain`).prop('disabled', true);
+        $(`#transferBtn`).prop('disabled', chains.filter(r=>[sourceChain.name, destinationChain.name].includes(r.name)).map(r=>r.session).includes(null));
+        getPreviousTransactions()
+
+      })
+      .catch(ex=> alert(ex));
+  }
+
+  const logout = type => {
+    const chain =  chains.find(c=>c.name===$(`#${type}Chain`).val());
+    $(`#${type}Logout`).hide();
+    $(`#${type}Login`).show();
+    $(`#${type}Chain`).prop('disabled', false);
+    $(`#transferBtn`).prop('disabled', true);
+    if (!chain || !chain.session) return;
+    chain.session?.remove();
+    chain.session = null;
+    chain.auth = null;
+    getPreviousTransactions()
+  }
+
+  const lock = () => {
+    $(`#transferBtn`).prop('disabled', true);
+    $(`#sourceLogout`).prop('disabled', true);
+    $(`#destinationLogout`).prop('disabled', true);
+    $(`#sourceAsset`).prop('disabled', true);
+    $(`#amount`).prop('disabled', true);
+  }
+
+  const reset = () =>{
+    $('#resetBtn').hide();
+    $('#status').html("<div><div>Fetching tokens available for IBC</div><div class='progressDiv'>100%</div></div>");
+    $(`#transferBtn`).prop('disabled', false);
+    $(`#sourceLogout`).prop('disabled', false);
+    $(`#destinationLogout`).prop('disabled', false);
+    $(`#sourceAsset`).prop('disabled', false);
+    $(`#amount`).prop('disabled', false);
+  }
+
+  const submitProof = async () =>{
+    $('#status').append(`<div><div>Submitting proof(s)<span class="proofTx" style="margin-left:12px"></span></div> <div class="progressDiv">0%</div></div>`);
+    $('#resetBtn').hide();
+    try{
+      console.log("destinationActions",destinationActions)
+      const signedDestinationTx = await destinationChain.session.transact({actions: destinationActions}, {broadcast:false, expireSeconds:360, blocksBehind:3});
+      $('.progressDiv').last().html("50%");
+      
+      submitTx(signedDestinationTx, destinationChain, 6 ).then( async result => {
+        $('.progressDiv').last().html("100%");
+        $('.btn-warning').prop('disabled', true);
+
+        console.log("result", result);
+        $('.proofTx').last().html(`<a target="_blank" style="color:#1a8754" href="${destinationChain.txExplorer}/${result.processed.id}">Proof TX<a>`)
+        $('#resetBtn').show();
+        getPreviousTransactions();
+      });
+
+    }catch(ex){ //catch signing errors
+      $('.progressDiv').last().html("Error");
+      console.log("Error signing transaction");
+      if(progressInterval) clearInterval(progressInterval);
+      $('.btn-warning').last().addClass('is-disabled');
+      $('.btn-warning').last().prop('disabled', true);
+      $('#status').append(`<br><div><div>Error signing TX</div><div> <button class="btn btn-warning btn-sm" style="width:54px;--bs-btn-padding-y: 0.125rem;" onclick="submitProof()">Retry</button></div></div>`);
+      $('#resetBtn').show();
+    }
+  }
+
+  const getProof = ({type="heavyProof", block_to_prove, action, last_proven_block}) => {
+    return new Promise(resolve=>{
+      //initialize socket to proof server
+      const ws = new WebSocket(sourceChain.proofSocket);
+      ws.addEventListener('open', (event) => {
+        // connected to websocket server
+        const query = { type, block_to_prove };
+        if (last_proven_block) query.last_proven_block = last_proven_block;
+        if (action) query.action_receipt = action.receipt;
+        ws.send(JSON.stringify(query));
+      });
+
+      //messages from websocket server
+      ws.addEventListener('message', (event) => {
+        const res = JSON.parse(event.data);
+        //log non-progress messages from ibc server
+        if (res.type !=='progress') console.log("Received message from ibc proof server", res);
+        if (res.type =='progress') $('.progressDiv').last().html(res.progress +"%");
+        if (res.type !=='proof') return;
+        ws.close();
+
+        $('.progressDiv').last().html("100%");
+
+        let name;
+        if (res.query.type === 'lightProof') name = tokenRow.native ? "issueb" : "withdrawb";
+        else name = !action ? "checkproofd" : tokenRow.native ? "issuea" : "withdrawa"
+
+        //handle issue/withdraw if proving transfer/retire 's emitxfer action, else submit block proof to bridge directly (for schedules)
+        const actionToSubmit = { 
+          authorization: [destinationChain.auth],
+          name,
+          account: !action ? destinationChain.bridgeContract : tokenRow.native ? tokenRow.pairedWrapTokenContract : tokenRow.wrapLockContract,
+          data: { ...res.proof, prover: destinationChain.auth.actor } 
+        };
+
+        //if proving an action, add action and formatted receipt to actionproof object
+        if (action) {
+          let auth_sequence = [];
+          for (var authSequence of action.receipt.auth_sequence) auth_sequence.push({ account: authSequence[0], sequence: authSequence[1] });
+          actionToSubmit.data.actionproof = {
+            ...res.proof.actionproof,
+            action: {
+              account: action.act.account,
+              name: action.act.name,
+              authorization: action.act.authorization,
+              data: action.act.hex_data
+            },
+            receipt: { ...action.receipt, auth_sequence }
+          }
+        }
+        resolve(actionToSubmit);
+      });
+    });
+  }
+
+  const submitTx = (signedTx, chain, retry_trx_num_blocks=null) => {
+    let leap = chain.version && chain.version >=3;
+    let url = `${chain.nodeUrl}/v1/chain/send_transaction`;
+    let obj = {
+      signatures: signedTx.signatures,
+      compression: signedTx.compression || false,
+      packed_trx: arrayToHex(signedTx.resolved.serializedTransaction),
+      packed_context_free_data: null
+    }
+    if (leap){
+      url+='2'; //use send transaction2 if available
+      obj = {
+        transaction: obj,
+        return_failure_trace: false,
+        retry_trx: true,
+        retry_trx_num_blocks, //if not specified, it defaults to LIB
+      }
+      return $.post(url, JSON.stringify(obj));
+    }
+
+
+   return pushGurantee(chain, obj, retry_trx_num_blocks); //if waiting for lib
+  }
+
+  //Add retry logic and waiting for blocks to send_transaction, to emulate send_transaction2 retry_trx_num_blocks
+  const pushGurantee = async (chain, packedTx, retry_trx_num_blocks ) => new Promise(async resolve=>{
+    let tx;
+    try{
+      tx = await $.post(`${chain.nodeUrl}/v1/chain/send_transaction`, JSON.stringify(packedTx));
+      console.log("tx",JSON.parse(JSON.stringify(tx)));
+    }catch(ex){
+      if(progressInterval) clearInterval(progressInterval);
+      $('#resetBtn').show();
+      $('.progressDiv').last().html("Error");
+      console.log("Exception submitting tx", ex);
+
+      $('.btn-warning').last().addClass('is-disabled');
+      $('.btn-warning').last().prop('disabled', true);
+      if (destinationActions) $('#status').append(`<br><div><div>Error submitting proof(s):</div><div> <button class="btn btn-warning btn-sm" style="width:54px;--bs-btn-padding-y: 0.125rem;" onclick="submitProof()">Retry</button></div></div>`);
+      else $('#status').append(`<br><div>Error submitting TX: </div>`);
+      $('#status').append(`<div>${ex.responseJSON.error.details[0].message}</div>`);
+      if (ex.responseJSON.error.details[1]) $('#status').append(`<div>${ex.responseJSON.error.details[1].message}</div>`)
+      return 
+    }
+
+    const transaction_id = tx.processed.id;
+    let finished = false;
+    let delay = 500;
+    while (!finished){
+      await sleep(delay);
+      delay*=1.1;
+      delay=Math.min(delay, 5000)
+      try{
+
+      
+        const block = await $.post(`${chain.nodeUrl}/v1/chain/get_block`, JSON.stringify({block_num_or_id: tx.processed.block_num }));
+        const txFound = block.transactions.find(r=>r.trx.id === transaction_id);
+        if (txFound) { //if tx is in block, check relation to retry_trx_num_blocks
+          const headInfo = await $.get(`${chain.nodeUrl}/v1/chain/get_info`);
+          // console.log("Blocks passed: ~" + (headInfo.head_block_num - tx.processed.block_num) + "/330", "LIB: " + headInfo.last_irreversible_block_num)
+          if (
+            (!retry_trx_num_blocks && headInfo.last_irreversible_block_num  >= tx.processed.block_num)  || // passed lib
+            (retry_trx_num_blocks && headInfo.head_block_num - tx.processed.block_num >= retry_trx_num_blocks) // passed blocks specified
+          ) finished = true;
+        }
+        else if(!txFound){ //if tx is not in block, resubmit packed tx
+          try{ 
+            tx = await $.post(`${chain.nodeUrl}/v1/chain/send_transaction`, JSON.stringify(packedTx)); 
+            console.log("tx not found in block (fork/stale block), resubmitted tx",tx);
+          }
+          catch(ex){//handle duplicate tx error, in case it auto got included in next block than reported, check next block and so on
+            console.log(ex)
+            //TODO verify exception is duplicate tx error
+            tx.processed.block_num++;
+            console.log("exception resubmitting duplicate tx, incremented block number to find tx", tx.processed.block_num)
+          }
+        }
+      }catch(ex){console.log("lost internet, retrying")}
+    }// end of while
+    if (retry_trx_num_blocks) return resolve(tx); //return tx if we dont need to worry about correct global action
+    //fetch from firehose to set correct global sequence (from produced block) in action_receipt
+    const ws = new WebSocket(sourceChain.proofSocket);
+    ws.addEventListener('open', (event) => ws.send(JSON.stringify({ type: "getBlockActions", block_to_prove: tx.processed.block_num })));
+    ws.addEventListener('message', (event) => {
+      const res = JSON.parse(event.data);
+      console.log("res",res)
+      const firhoseTx = res.txs.find(r=>r.find(s=>s.transactionId === transaction_id));
+      console.log("firhoseTx",firhoseTx)
+      const firehoseEmitxfer = firhoseTx.find(r=>r.action.name==='emitxfer');
+      console.log("firehoseEmitxfer",firehoseEmitxfer)
+      let emitxferAction = tx.processed.action_traces.find(r=>r.act.name==='emitxfer');
+      console.log("api emitxferAction receipt", JSON.parse(JSON.stringify(emitxferAction.receipt)))
+
+      emitxferAction.receipt = firehoseEmitxfer.receipt;
+      //convert firehose authSequence to expected format for ibc-proof server
+      let auth_sequence = [];
+      for (var auth of emitxferAction.receipt.auth_sequence) auth_sequence.push([auth.account, auth.sequence]);
+      emitxferAction.receipt.auth_sequence = auth_sequence;
+      console.log("bp emitxferAction receipt",firehoseEmitxfer.receipt)
+      resolve(tx);
+    });
+  })
+  const sleep = ms => new Promise(resolve=>setTimeout(resolve,ms)); 
+
+  //eosio name helper functions
+  const char_to_symbol = c => {
+    if (typeof c == 'string') c = c.charCodeAt(0);
+    if (c >= 'a'.charCodeAt(0) && c <= 'z'.charCodeAt(0)) return c - 'a'.charCodeAt(0) + 6;
+    if (c >= '1'.charCodeAt(0) && c <= '5'.charCodeAt(0)) return c - '1'.charCodeAt(0) + 1;
+    return 0;
+  };
+
+  const toName = value => {
+    let v = BigInt.asUintN(64, value), result = '';
+    while (v > 0) {
+      const c = v & BigInt(0xff);
+      result += String.fromCharCode(Number(c.toString()));
+      v >>= 8n;
+    }
+    return result;
+  };
+
+  const nameToUint64 = s => {
+    let n = 0n, i = 0;
+    for (; i < 12 && s[i]; i++) n |= BigInt(char_to_symbol(s.charCodeAt(i)) & 0x1f) << BigInt(64 - 5 * (i + 1));
+    if (i == 12) n |= BigInt(char_to_symbol(s.charCodeAt(i)) & 0x0f);
+    return n.toString();
+  };
+
+  const arrayToHex = data => {
+    let result = '';
+    for (const x of data)  result += ('00' + x.toString(16)).slice(-2);
+    return result.toUpperCase();
+  };
+ 
+  async function getPreviousTransactions() {
+    tokenRow = sourceChain.symbols.find(r=>r.id===parseInt($('#sourceAsset').val()));
+    previousActions = [];
+    $('#previousTransactions').html("")
+    let url;
+    if (!sourceChain.auth|| !destinationChain.auth || !tokenRow) return;
+    $('#incomplete').remove();
+    $('#status').append("<div id='incomplete'><div>Fetching IBC transfers</div><div class='progressDiv'>0%</div></div>");
+
+
+    if(tokenRow.native) url = `${sourceChain.hyperion}/v2/history/get_actions?account=${tokenRow.wrapLockContract}&filter=${tokenRow.nativeTokenContract}:transfer&transfer.from=${sourceChain.auth.actor}&transfer.memo=${destinationChain.auth.actor}&limit=15`;
+    else url = `${sourceChain.hyperion}/v2/history/get_actions?account=${sourceChain.auth.actor}&filter=${tokenRow.pairedWrapTokenContract}:retire&limit=15`;
+
+
+    let emitxfrTransactions = (await $.get(url)).actions;
+    console.log("emitxfrTransactions",emitxfrTransactions)
+    if (!emitxfrTransactions) return;
+    emitxfrTransactions = emitxfrTransactions.filter(r=>r.act.data.quantity.split(" ")[1]===tokenRow.symbol)
+    $('.progressDiv').last().html("30%");
+
+    console.log("emitxfrTransactions",emitxfrTransactions)
+    let txPromises = [];
+    for (var tx of emitxfrTransactions) txPromises.push( $.get(`${sourceChain.hyperion}/v2/history/get_transaction?id=${tx.trx_id}`) );
+    let txResults = await Promise.all(txPromises);
+    console.log("txResults",txResults);
+    $('.progressDiv').last().html("70%");
+
+
+    // return
+    for (var tx of txResults) {
+      let xfer = tx.actions.find(action => action.act.name === "emitxfer");
+      let receiptDigest;
+      if (sourceChain.hyperion) receiptDigest = await getReceiptDigest(xfer.receipts[0], xfer, sourceChain);
+      else receiptDigest= getReceiptDigest(xfer.receipt);
+
+      previousActions.push({
+        date: new Date(xfer.timestamp + "Z"),
+        transaction_id: xfer.trx_id,
+        data: xfer.act.data.xfer,
+        receiptDigest,
+        proven: null,
+        action: xfer,
+        block_num: xfer.block_num
+      });
+    }
+    let provenList = await $.post(
+      `${destinationChain.nodeUrl}/v1/chain/get_table_rows`,
+      JSON.stringify({
+        code: tokenRow.native ? tokenRow.pairedWrapTokenContract: tokenRow.wrapLockContract,
+        scope: tokenRow.native ? tokenRow.pairedWrapTokenContract: tokenRow.wrapLockContract,
+        table: "processed",
+        json: true,
+        limit: 1000,
+        reverse: true
+      })
+    );
+    provenList = provenList.rows ? provenList.rows.map(r => r.receipt_digest) : [];
+    let prevTransfersData = []
+    $('.progressDiv').last().html("100%");
+
+
+    for (var row of previousActions) {
+      row.proven = provenList.includes(row.receiptDigest);
+      prevTransfersData.push({
+        sourceChainName: sourceChain.name.toUpperCase(),
+        destinationChainName:destinationChain.name.toUpperCase(),
+        symbol: tokenRow.symbol,
+        amount: row.data.quantity.quantity.split(" ")[0],
+        date: row.date,
+        status: row.proven? "Complete":"Failed",
+        transaction_id: row.transaction_id,
+        proven:row.proven
+      })
+    }
+    let htmlTable = "<table class='previousTransactions'>"
+    htmlTable+=
+    `<head>
+      <th>Symbol</th>
+      <th>Date</th>
+      <th>Amount</th>
+      <th>Source</th>
+      <th>Destin.</th>
+      <th>Status</th>
+      <th></th>  
+     </head>
+    `  
+    for (var r of prevTransfersData) {
+      htmlTable+="<tr>"
+      htmlTable+=`<td>${r.symbol}</td>`
+      htmlTable+=`<td>${r.date.toLocaleDateString()}</td>`
+      htmlTable+=`<td>${r.amount}</td>`
+      htmlTable+=`<td>${r.sourceChainName}</td>`
+      htmlTable+=`<td>${r.destinationChainName}</td>`
+      htmlTable+=`<td>${r.status}</td>`
+      // htmlTable+=`<td>${row.status}</td>`
+      if (!r.proven) htmlTable+=`<td><button onclick="submitExisting('${r.transaction_id}')" class='btn btn-warning btn-sm'>Retry</button></td>`
+      else htmlTable+=`<td><button onclick="window.open('${sourceChain.txExplorer+'/'+r.transaction_id}')" class='btn btn-success btn-sm'>Explorer</button></td>`
+      htmlTable+="</tr>"
+    }
+    htmlTable+="</table>"
+    $('#previousTransactions').html(htmlTable)
+
+    lastBlockProvedRes = await $.post(`${destinationChain.nodeUrl}/v1/chain/get_table_rows`, JSON.stringify({ reverse:true, json: true, code: destinationChain.bridgeContract, scope: sourceChain.name, table: 'lastproofs',limit:1}))
+    lastBlockProvedRes = lastBlockProvedRes.rows[0]? lastBlockProvedRes.rows[0] : null;
+    console.log("lastBlockProvedRes",lastBlockProvedRes)
+    
+  }
+
+  async function getReceiptDigest(receipt, action, chain){
+    let eosApi = chain.session.link.transport.activeRequest.abiProvider ;
+    let returnValueEnabled = chain.returnValue;
+
+    let lockAbi = await eosApi.getAbi(action.act.account);
+    abiTypes = getTypesFromAbi(createInitialTypes(), lockAbi);
+
+    const types = createInitialTypes();
+    const eosjsTypes = {
+      name: types.get("name"), 
+      bytes: types.get("bytes"), 
+      uint8: types.get("uint8"), 
+      uint16: types.get("uint16"), 
+      uint32: types.get("uint32"), 
+      uint64: types.get("uint64"), 
+      varuint32: types.get("varuint32"), 
+      checksum256: types.get("checksum256")
+    }
+
+    const { name, uint8, uint64,varuint32, checksum256, bytes  } = eosjsTypes;
+
+    const nameToUint64 = (s) => {
+      let n = 0n;
+      let i = 0;
+      for (; i < 12 && s[i]; i++)  n |= BigInt(char_to_symbol(s.charCodeAt(i)) & 0x1f) << BigInt(64 - 5 * (i + 1));
+      if (i == 12)  n |= BigInt(char_to_symbol(s.charCodeAt(i)) & 0x0f);
+      return n.toString();
+    };
+    //if act_digest and hex_data is not part of receipt (hyperion) then calculate them
+    if (!receipt.act_digest){
+
+      const buff = new SerialBuffer({ TextEncoder, TextDecoder });
+      abiTypes.get('emitxfer').serialize(buff, action.act.data);
+      var serializedTransferData = Buffer.from(buff.asUint8Array()).toString('hex');
+      action.act.hex_data = serializedTransferData
+
+      receipt.abi_sequence = action.abi_sequence;
+      receipt.code_sequence = action.code_sequence;
+
+      //calculate receipt digest
+
+      if (returnValueEnabled){
+        var base_hash = await getBaseActionDigest(action.act);
+        var data_hash = await getDataDigest(action.act, "");
+
+        var buff1 = Buffer.from(base_hash, "hex")
+        var buff2 = Buffer.from(data_hash, "hex")
+
+        var buffFinal = Buffer.concat([buff1, buff2]);
+        receipt.act_digest = await CH.createHash("sha256").update(buffFinal).digest("hex");
+      }
+
+      else{
+        var actionBuffer = new SerialBuffer({ TextEncoder, TextDecoder });
+        var action2 = {
+          account: action.act.account,
+          name: action.act.name,
+          authorization: action.act.authorization,
+          data: serializedTransferData
+        }
+    
+        abiTypes.get('action').serialize(actionBuffer, action2);
+        receipt.act_digest = await CH.createHash("sha256").update(actionBuffer.asUint8Array()).digest("hex");
+      }
+      
+      function getBaseActionDigest(a){
+        const buff = new SerialBuffer({ TextEncoder, TextDecoder });
+        
+        uint64.serialize(buff, nameToUint64(a.account));
+        uint64.serialize(buff, nameToUint64(a.name));
+        varuint32.serialize(buff, a.authorization.length);
+
+        for (var i = 0 ; i < a.authorization.length;i++){
+          uint64.serialize(buff, nameToUint64(a.authorization[i].actor));
+          uint64.serialize(buff, nameToUint64(a.authorization[i].permission));
+        }
+
+        return CH.createHash("sha256").update(buff.asUint8Array()).digest("hex");
+      }
+
+      function getDataDigest(act, returnValue){
+        const buff = new SerialBuffer({ TextEncoder, TextDecoder });
+        bytes.serialize(buff, act.hex_data);
+        bytes.serialize(buff, returnValue);
+        return CH.createHash("sha256").update(buff.asUint8Array()).digest("hex");
+      }
+    }
+
+    const buff = new SerialBuffer({ TextEncoder, TextDecoder });
+
+    //handle different formats of receipt for dfuse (camelCase) and nodeos
+
+    //if receipt is in nodeos format, convert to dfuse format
+    if (receipt.act_digest && !receipt.digest){
+      
+      let authSequence = [];
+      for (var auth of receipt.auth_sequence) authSequence.push({ accountName: auth.account, sequence: auth.sequence })
+
+      receipt = {
+        receiver: receipt.receiver,
+        digest: receipt.act_digest,
+        globalSequence: parseInt(receipt.global_sequence),
+        recvSequence: parseInt(receipt.recv_sequence),
+        authSequence,
+        codeSequence: action.code_sequence,
+        abiSequence: action.abi_sequence,
+      }
+    }
+    name.serialize(buff, receipt.receiver);
+    checksum256.serialize(buff, receipt.digest);
+    uint64.serialize(buff, receipt.globalSequence);
+    uint64.serialize(buff, receipt.recvSequence);
+
+    if (receipt.authSequence)  {
+      varuint32.serialize(buff, receipt.authSequence.length);
+      for (var auth of receipt.authSequence){
+        name.serialize(buff, auth.accountName);
+        uint64.serialize(buff, auth.sequence);
+      }
+    }
+    else varuint32.serialize(buff, 0);
+
+    if (receipt.codeSequence) varuint32.serialize(buff, receipt.codeSequence);
+    else varuint32.serialize(buff, 0);
+
+    if (receipt.abiSequence) varuint32.serialize(buff, receipt.abiSequence);
+    else varuint32.serialize(buff, 0);
+
+    return await CH.createHash("sha256").update(buff.asUint8Array()).digest("hex");
+    
+  }
+
+  async function submitExisting(tx_id){
+    const prevTransfer = previousActions.find(r=>r.transaction_id === tx_id);
+    const block_to_prove = prevTransfer.block_num;
+    let emitxferAction = {
+      act: prevTransfer.action.act,
+      receipt:{
+        ...prevTransfer.action.receipts[0],
+        code_sequence: prevTransfer.action.code_sequence,
+        abi_sequence: prevTransfer.action.abi_sequence,
+      }
+    };
+    let auth_sequence = [];
+    for (var auth of prevTransfer.action.receipts[0].auth_sequence) auth_sequence.push([auth.account, auth.sequence]);
+    emitxferAction.receipt.auth_sequence = auth_sequence;
+
+    let light = lastBlockProvedRes && lastBlockProvedRes.block_height > block_to_prove; 
+    
+    let query = {
+      type: light? "lightProof": "heavyProof",
+      action: emitxferAction,
+      block_to_prove: block_to_prove //block that includes the emitxfer action we want to prove
+    }
+
+    if(light) query.last_proven_block = lastBlockProvedRes.block_height;
+
+    let emitxferProof = await getProof(query);
+    console.log("emitxferProof",emitxferProof);
+
+    destinationActions = [emitxferProof];
+    submitProof();
+  } 
+</script>
+
+<style>
+  html,body{ background-color: #31313d; color:white; font-family: Verdana, Geneva, Tahoma, sans-serif; }
+  .flexRow{ display: flex; align-items: center; justify-content: space-between;}
+  label{ width:70px; text-align: left;color:white; }
+  .form-select, .form-control, button{ width:272px; }
+  .form-select:disabled { background-color: #adafb2; }
+  .box{ padding:16px; border:1px solid #64646d;margin-top:44px; }
+  .box > div, #status > div{ display:flex; justify-content: space-between; }
+  #previousTransactions > table{ width:100%; margin-top: 24px; text-align: center; }
+  #previousTransactions  button{ width:76px; }
+  #previousTransactions  td{ padding-bottom: 10px;}
+</style>
+</html>
