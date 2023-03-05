@@ -760,6 +760,8 @@
     let emitxferProof = await getProof(query);
     console.log("emitxferProof",emitxferProof);
 
+    if(light) emitxferProof.data.blockproof.root = lastBlockProvedRes.block_merkle_root;
+
     destinationActions = [emitxferProof];
     submitProof();
   } 
